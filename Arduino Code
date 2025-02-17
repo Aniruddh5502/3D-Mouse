@@ -1,0 +1,173 @@
+#include <Wire.h>
+#include <MPU6050.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include "BLE2902.h"
+#include "BLEHIDDevice.h"
+
+// HID Report Descriptors
+const uint8_t hidReportDescriptor[] = {
+  0x05, 0x01,  // USAGE_PAGE (Generic Desktop)
+  0x09, 0x02,  // USAGE (Mouse)
+  0xa1, 0x01,  // COLLECTION (Application)
+  0x09, 0x01,  //   USAGE (Pointer)
+  0xa1, 0x00,  //   COLLECTION (Physical)
+  0x85, 0x01,  //     REPORT_ID (1)
+  0x05, 0x09,  //     USAGE_PAGE (Button)
+  0x19, 0x01,  //     USAGE_MINIMUM (Button 1)
+  0x29, 0x03,  //     USAGE_MAXIMUM (Button 3)
+  0x15, 0x00,  //     LOGICAL_MINIMUM (0)
+  0x25, 0x01,  //     LOGICAL_MAXIMUM (1)
+  0x95, 0x03,  //     REPORT_COUNT (3)
+  0x75, 0x01,  //     REPORT_SIZE (1)
+  0x81, 0x02,  //     INPUT (Data,Var,Abs)
+  0x95, 0x01,  //     REPORT_COUNT (1)
+  0x75, 0x05,  //     REPORT_SIZE (5)
+  0x81, 0x03,  //     INPUT (Cnst,Var,Abs)
+  0x05, 0x01,  //     USAGE_PAGE (Generic Desktop)
+  0x09, 0x30,  //     USAGE (X)
+  0x09, 0x31,  //     USAGE (Y)
+  0x15, 0x81,  //     LOGICAL_MINIMUM (-127)
+  0x25, 0x7f,  //     LOGICAL_MAXIMUM (127)
+  0x75, 0x08,  //     REPORT_SIZE (8)
+  0x95, 0x02,  //     REPORT_COUNT (2)
+  0x81, 0x06,  //     INPUT (Data,Var,Rel)
+  0xc0,        //   END_COLLECTION
+  0xc0         // END_COLLECTION
+};
+
+// Mouse sensitivity settings
+const float SENSITIVITY_X = 10.0;
+const float SENSITIVITY_Y = 10.0;
+
+// Bluetooth device settings
+BLEHIDDevice* hid;
+BLECharacteristic* inputMouse;
+bool connected = false;
+
+// MPU6050
+MPU6050 mpu;
+
+// Variables for MPU control
+int16_t ax, ay, az;
+int16_t gx, gy, gz;
+float accX, accY, accZ;
+float gyroX, gyroY, gyroZ;
+float angleX, angleY;
+float alpha = 0.96;
+float dt;
+
+// Button pins
+const int TRIGGER_PIN = 4;
+const int SECONDARY_PIN = 5;
+
+class MyCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* server) {
+    connected = true;
+  }
+  void onDisconnect(BLEServer* server) {
+    connected = false;
+  }
+};
+
+
+
+
+void updateAngle() {
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  accX = ax / 16384.0;
+  accY = ay / 16384.0;
+  accZ = az / 16384.0;
+
+  gyroX = gx / 131.0;
+  gyroY = gy / 131.0;
+  gyroZ = gz / 131.0;
+
+  static uint32_t previousTime = 0;
+  uint32_t currentTime = micros();
+  dt = (currentTime - previousTime) / 1000000.0;
+  previousTime = currentTime;
+
+  float accel_angleX = atan2(accY, accZ) * RAD_TO_DEG;
+  float accel_angleY = atan2(-accX, sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
+
+  angleX = alpha * (angleX + gyroX * dt) + (1 - alpha) * accel_angleX;
+  angleY = alpha * (angleY + gyroY * dt) + (1 - alpha) * accel_angleY;
+}
+
+void sendReport(int8_t x, int8_t y, bool leftButton, bool rightButton) {
+  if (connected && inputMouse) {
+    uint8_t buttons = 0;
+    if (leftButton) buttons |= 1;
+    if (rightButton) buttons |= 2;
+
+    uint8_t report[] = { buttons, x, y };
+    inputMouse->setValue(report, sizeof(report));
+    inputMouse->notify();
+  }
+}
+
+void setup() {
+  Wire.begin();
+  Serial.begin(2000000);
+
+  // Initialize MPU6050
+  mpu.initialize();
+  if (!mpu.testConnection()) {
+    Serial.println("MPU connection failed!");
+    while (1)
+      ;
+  }
+
+  // Setup button pins
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);
+  pinMode(SECONDARY_PIN, INPUT_PULLUP);
+
+  // Initialize BLE
+  BLEDevice::init("Ani21_3D_MOUSE");
+  BLEServer* server = BLEDevice::createServer();
+  server->setCallbacks(new MyCallbacks());
+
+  // Create HID device
+  hid = new BLEHIDDevice(server);
+  inputMouse = hid->inputReport(1);
+
+  // Set HID report descriptor
+  hid->manufacturer()->setValue("Maker");
+  hid->pnp(0x02, 0x05ac, 0x820a, 0x0001);
+  hid->hidInfo(0x00, 0x01);
+  hid->reportMap((uint8_t*)hidReportDescriptor, sizeof(hidReportDescriptor));
+  hid->startServices();
+
+  // Advertising
+  BLEAdvertising* advertising = server->getAdvertising();
+  advertising->setAppearance(HID_MOUSE);
+  advertising->addServiceUUID(hid->hidService()->getUUID());
+  advertising->start();
+
+  Serial.println("BLE Mouse ready");
+}
+
+void loop() {
+  updateAngle();
+
+  int moveX = (int)(gyroY / SENSITIVITY_X);
+  int moveY = (int)(gyroX / SENSITIVITY_Y);
+
+  // Apply deadzone
+  if (abs(moveX) < 1) moveX = 0;
+  if (abs(moveY) < 1) moveY = 0;
+
+  // Constrain values to int8_t range
+  moveX = constrain(moveX, -127, 127);
+  moveY = constrain(moveY, -127, 127);
+
+  bool trigger = !digitalRead(TRIGGER_PIN);
+  bool secondary = !digitalRead(SECONDARY_PIN);
+
+  sendReport(moveX, moveY, trigger, secondary);
+
+  delay(5);
+}
