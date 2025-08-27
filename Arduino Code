@@ -1,173 +1,332 @@
 #include <Wire.h>
 #include <MPU6050.h>
+#include "MadgwickAHRS.h"
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
 #include "BLE2902.h"
 #include "BLEHIDDevice.h"
 
-// HID Report Descriptors
-const uint8_t hidReportDescriptor[] = {
-  0x05, 0x01,  // USAGE_PAGE (Generic Desktop)
-  0x09, 0x02,  // USAGE (Mouse)
-  0xa1, 0x01,  // COLLECTION (Application)
-  0x09, 0x01,  //   USAGE (Pointer)
-  0xa1, 0x00,  //   COLLECTION (Physical)
-  0x85, 0x01,  //     REPORT_ID (1)
-  0x05, 0x09,  //     USAGE_PAGE (Button)
-  0x19, 0x01,  //     USAGE_MINIMUM (Button 1)
-  0x29, 0x03,  //     USAGE_MAXIMUM (Button 3)
-  0x15, 0x00,  //     LOGICAL_MINIMUM (0)
-  0x25, 0x01,  //     LOGICAL_MAXIMUM (1)
-  0x95, 0x03,  //     REPORT_COUNT (3)
-  0x75, 0x01,  //     REPORT_SIZE (1)
-  0x81, 0x02,  //     INPUT (Data,Var,Abs)
-  0x95, 0x01,  //     REPORT_COUNT (1)
-  0x75, 0x05,  //     REPORT_SIZE (5)
-  0x81, 0x03,  //     INPUT (Cnst,Var,Abs)
-  0x05, 0x01,  //     USAGE_PAGE (Generic Desktop)
-  0x09, 0x30,  //     USAGE (X)
-  0x09, 0x31,  //     USAGE (Y)
-  0x15, 0x81,  //     LOGICAL_MINIMUM (-127)
-  0x25, 0x7f,  //     LOGICAL_MAXIMUM (127)
-  0x75, 0x08,  //     REPORT_SIZE (8)
-  0x95, 0x02,  //     REPORT_COUNT (2)
-  0x81, 0x06,  //     INPUT (Data,Var,Rel)
-  0xc0,        //   END_COLLECTION
-  0xc0         // END_COLLECTION
-};
 
-// Mouse sensitivity settings
-const float SENSITIVITY_X = 10.0;
-const float SENSITIVITY_Y = 10.0;
+// -------------- Config --------------
+#define SAMPLE_RATE_HZ     1000     // raw sampling (Hz)
+#define OUTPUT_RATE_HZ     20       // delivered processed rate (Hz)
+#define SAMPLES_PER_OUTPUT (SAMPLE_RATE_HZ / OUTPUT_RATE_HZ) // e.g., 50
 
-// Bluetooth device settings
-BLEHIDDevice* hid;
-BLECharacteristic* inputMouse;
-bool connected = false;
+// Sensitivity mapping (tune to taste)
+const float SENSITIVITY_X = 10.0f;  // degrees per HID-step
+const float SENSITIVITY_Y = 10.0f;
 
-// MPU6050
-MPU6050 mpu;
+// Filtering / smoothing
+const float EMA_ALPHA = 0.30f;      // smoothing on output angles
 
-// Variables for MPU control
-int16_t ax, ay, az;
-int16_t gx, gy, gz;
-float accX, accY, accZ;
-float gyroX, gyroY, gyroZ;
-float angleX, angleY;
-float alpha = 0.96;
-float dt;
+// Bias estimation
+const float GYRO_STATIONARY_THRESH = 0.5f;  // deg/s threshold for "stationary"
+const int   STATIONARY_COUNT_MAX   = 40;    // outputs to confirm stationary
 
-// Button pins
-const int TRIGGER_PIN = 4;
+// Buttons
+const int TRIGGER_PIN   = 4;
 const int SECONDARY_PIN = 5;
 
-class MyCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* server) {
-    connected = true;
-  }
-  void onDisconnect(BLEServer* server) {
-    connected = false;
-  }
+// Queue length for averaged samples
+#define AVG_QUEUE_LEN 8
+
+// -------------- HID descriptor (Bluetooth HID mouse) --------------
+const uint8_t hidReportDescriptor[] = {
+  0x05,0x01, 0x09,0x02, 0xA1,0x01, 0x09,0x01, 0xA1,0x00,
+  0x85,0x01,
+  0x05,0x09, 0x19,0x01, 0x29,0x03, 0x15,0x00, 0x25,0x01,
+  0x95,0x03, 0x75,0x01, 0x81,0x02,
+  0x95,0x01, 0x75,0x05, 0x81,0x03,
+  0x05,0x01, 0x09,0x30, 0x09,0x31,
+  0x15,0x81, 0x25,0x7F, 0x75,0x08, 0x95,0x02, 0x81,0x06,
+  0xC0, 0xC0
 };
 
+// -------------- Types --------------
+struct AvgSample {
+  int32_t ax_sum;   // sums of raw int16 -> use 32-bit accumulation to avoid overflow
+  int32_t ay_sum;
+  int32_t az_sum;
+  int32_t gx_sum;
+  int32_t gy_sum;
+  int32_t gz_sum;
+  uint32_t ts_us;   // timestamp of last sample in the block
+  uint16_t count;   // how many samples averaged (for robustness if variable)
+};
 
+// -------------- Global objects --------------
+MPU6050 mpu;
+Madgwick filter;
 
+// BLE HID
+BLEHIDDevice *hid;
+BLECharacteristic *inputMouse;
+volatile bool connected = false;
 
-void updateAngle() {
-  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+// Queue for averaged blocks
+QueueHandle_t avgQueue;
 
-  accX = ax / 16384.0;
-  accY = ay / 16384.0;
-  accZ = az / 16384.0;
+// Bias estimates and smoothing (accessed only inside processingTask)
+float gyroBiasX = 0.0f, gyroBiasY = 0.0f, gyroBiasZ = 0.0f;
+int stationaryCount = 0;
+float smoothedAngleX = 0.0f, smoothedAngleY = 0.0f;
 
-  gyroX = gx / 131.0;
-  gyroY = gy / 131.0;
-  gyroZ = gz / 131.0;
+// Performance counters (atomic-ish; samplingTask increments sampleCounter)
+volatile uint32_t sampleCounter = 0;
+volatile uint32_t processedCounter = 0;
 
-  static uint32_t previousTime = 0;
-  uint32_t currentTime = micros();
-  dt = (currentTime - previousTime) / 1000000.0;
-  previousTime = currentTime;
+// -------------- BLE callbacks --------------
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* server) { connected = true; Serial.println("BLE connected"); }
+  void onDisconnect(BLEServer* server) { connected = false; Serial.println("BLE disconnected"); BLEDevice::startAdvertising(); }
+};
 
-  float accel_angleX = atan2(accY, accZ) * RAD_TO_DEG;
-  float accel_angleY = atan2(-accX, sqrt(accY * accY + accZ * accZ)) * RAD_TO_DEG;
-
-  angleX = alpha * (angleX + gyroX * dt) + (1 - alpha) * accel_angleX;
-  angleY = alpha * (angleY + gyroY * dt) + (1 - alpha) * accel_angleY;
+// -------------- Helper functions --------------
+static inline float applyEMA(float val, float prev, float alpha) {
+  return alpha * val + (1.0f - alpha) * prev;
 }
 
-void sendReport(int8_t x, int8_t y, bool leftButton, bool rightButton) {
-  if (connected && inputMouse) {
-    uint8_t buttons = 0;
-    if (leftButton) buttons |= 1;
-    if (rightButton) buttons |= 2;
+void sendHIDReport(int8_t dx, int8_t dy, bool leftBtn, bool rightBtn) {
+  if (!connected || !inputMouse) return;
+  uint8_t buttons = 0;
+  if (leftBtn)  buttons |= 0x01;
+  if (rightBtn) buttons |= 0x02;
+  // Report ID 1 as in descriptor, followed by buttons, X, Y
+  uint8_t report[4] = {0x01, buttons, (uint8_t)dx, (uint8_t)dy};
+  inputMouse->setValue(report, sizeof(report));
+  inputMouse->notify();
+}
 
-    uint8_t report[] = { buttons, x, y };
-    inputMouse->setValue(report, sizeof(report));
-    inputMouse->notify();
+// -------------- Sampling Task (1 kHz) --------------
+void samplingTask(void *pvParameters) {
+  (void)pvParameters;
+  TickType_t xLastWake = xTaskGetTickCount();
+  const TickType_t xPeriod = pdMS_TO_TICKS(1); // 1 ms
+
+  // accumulators (32-bit to avoid overflow)
+  int32_t ax_acc = 0, ay_acc = 0, az_acc = 0;
+  int32_t gx_acc = 0, gy_acc = 0, gz_acc = 0;
+  uint16_t cnt = 0;
+  uint32_t last_ts = 0;
+
+  // raw buffers for getMotion6
+  int16_t ax, ay, az, gx, gy, gz;
+
+  for (;;) {
+    vTaskDelayUntil(&xLastWake, xPeriod); // precise 1 ms spacing
+
+    // Read MPU (I2C call allowed in task context)
+    mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+    last_ts = (uint32_t)esp_timer_get_time();
+
+    // accumulate raw ints
+    ax_acc += (int32_t)ax;
+    ay_acc += (int32_t)ay;
+    az_acc += (int32_t)az;
+    gx_acc += (int32_t)gx;
+    gy_acc += (int32_t)gy;
+    gz_acc += (int32_t)gz;
+    cnt++;
+    sampleCounter++;
+
+    // If we reached a full block, create AvgSample and push to queue
+    if (cnt >= SAMPLES_PER_OUTPUT) {
+      AvgSample block;
+      block.ax_sum = ax_acc;
+      block.ay_sum = ay_acc;
+      block.az_sum = az_acc;
+      block.gx_sum = gx_acc;
+      block.gy_sum = gy_acc;
+      block.gz_sum = gz_acc;
+      block.ts_us  = last_ts;
+      block.count  = cnt;
+
+      // We'll wait up to a short time to enqueue; if queue full, drop oldest (non-blocking)
+      if (xQueueSend(avgQueue, &block, pdMS_TO_TICKS(5)) != pdTRUE) {
+        // queue full - drop oldest: receive one and then try again
+        AvgSample tmp;
+        xQueueReceive(avgQueue, &tmp, 0);
+        xQueueSend(avgQueue, &block, 0);
+      }
+
+      // reset accumulators
+      ax_acc = ay_acc = az_acc = 0;
+      gx_acc = gy_acc = gz_acc = 0;
+      cnt = 0;
+    }
   }
 }
 
-void setup() {
-  Wire.begin();
-  Serial.begin(2000000);
+// -------------- Processing Task (~OUTPUT_RATE_HZ) --------------
+void processingTask(void *pvParameters) {
+  (void)pvParameters;
+  AvgSample block;
+  // Madgwick expects radians/sec for gyro (depends on library). We'll convert later.
+  for (;;) {
+    // Block until an averaged sample is available
+    if (xQueueReceive(avgQueue, &block, portMAX_DELAY) == pdTRUE) {
+      // Convert averaged raw sums to physical units
+      // accel LSB/g = 16384 for ±2g; gyro LSB/(°/s) = 131 for ±250 dps
+      float invCount = 1.0f / (float)block.count;
+      float ax_avg = (float)block.ax_sum * invCount;
+      float ay_avg = (float)block.ay_sum * invCount;
+      float az_avg = (float)block.az_sum * invCount;
+      float gx_avg = (float)block.gx_sum * invCount;
+      float gy_avg = (float)block.gy_sum * invCount;
+      float gz_avg = (float)block.gz_sum * invCount;
 
-  // Initialize MPU6050
+      // Convert to physical units (g and deg/s)
+      float ax_g = ax_avg / 16384.0f;
+      float ay_g = ay_avg / 16384.0f;
+      float az_g = az_avg / 16384.0f;
+      float gx_dps = gx_avg / 131.0f;
+      float gy_dps = gy_avg / 131.0f;
+      float gz_dps = gz_avg / 131.0f;
+
+      // ---------- Stationary detection & bias update ----------
+      // Use magnitude of averaged gyro (deg/s)
+      float gyro_mag = sqrtf(gx_dps*gx_dps + gy_dps*gy_dps + gz_dps*gz_dps);
+      if (gyro_mag < GYRO_STATIONARY_THRESH) {
+        stationaryCount++;
+        if (stationaryCount >= STATIONARY_COUNT_MAX) {
+          const float BIAS_ALPHA = 0.01f; // slow adaptation
+          gyroBiasX = BIAS_ALPHA * gx_dps + (1.0f - BIAS_ALPHA) * gyroBiasX;
+          gyroBiasY = BIAS_ALPHA * gy_dps + (1.0f - BIAS_ALPHA) * gyroBiasY;
+          gyroBiasZ = BIAS_ALPHA * gz_dps + (1.0f - BIAS_ALPHA) * gyroBiasZ;
+        }
+      } else {
+        stationaryCount = 0;
+      }
+
+      // ---------- Normalize accelerometer (after averaging) ----------
+      float norm = sqrtf(ax_g*ax_g + ay_g*ay_g + az_g*az_g);
+      if (norm > 1e-3f) {
+        ax_g /= norm; ay_g /= norm; az_g /= norm;
+      }
+
+      // ---------- Bias-correct gyro and convert to rad/s ----------
+      const float DEG_TO_RAD = 3.14159265358979323846f / 180.0f;
+      float gx_rad = (gx_dps - gyroBiasX) * DEG_TO_RAD;
+      float gy_rad = (gy_dps - gyroBiasY) * DEG_TO_RAD;
+      float gz_rad = (gz_dps - gyroBiasZ) * DEG_TO_RAD;
+
+      // ---------- Madgwick update (one call per averaged block) ----------
+      filter.updateIMU(gx_rad, gy_rad, gz_rad, ax_g, ay_g, az_g);
+
+      // Get roll & pitch in degrees (check your Madgwick lib API)
+      float roll = filter.getRoll();
+      float pitch = filter.getPitch();
+
+      // ---------- EMA smoothing ----------
+      smoothedAngleX = applyEMA(roll, smoothedAngleX, EMA_ALPHA);
+      smoothedAngleY = applyEMA(pitch, smoothedAngleY, EMA_ALPHA);
+
+      // ---------- Map to HID movement ----------
+      int moveX = (int)(smoothedAngleX / SENSITIVITY_X);
+      int moveY = (int)(smoothedAngleY / SENSITIVITY_Y);
+      if (abs(moveX) < 1) moveX = 0;
+      if (abs(moveY) < 1) moveY = 0;
+      moveX = constrain(moveX, -127, 127);
+      moveY = constrain(moveY, -127, 127);
+
+      // ---------- Read buttons ----------
+      bool leftBtn  = !digitalRead(TRIGGER_PIN);
+      bool rightBtn = !digitalRead(SECONDARY_PIN);
+
+      // ---------- Send HID report (task context -- safe) ----------
+      if (connected && (moveX != 0 || moveY != 0 || leftBtn || rightBtn)) {
+        sendHIDReport((int8_t)moveX, (int8_t)moveY, leftBtn, rightBtn);
+      }
+
+      processedCounter++;
+    }
+  }
+}
+
+// -------------- Initialization (MPU + BLE) --------------
+void initMPU() {
+  Wire.begin();
+  Wire.setClock(400000);
   mpu.initialize();
   if (!mpu.testConnection()) {
-    Serial.println("MPU connection failed!");
-    while (1)
-      ;
+    Serial.println("MPU6050 connection failed!");
+    while (1) { delay(1000); }
   }
+  // Configure ranges + DLPF + sample rate divider for internal sampling (we still poll manually)
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  mpu.setDLPFMode(MPU6050_DLPF_BW_98); // ~98 Hz accel BW (reasonable)
+  // mpu.setRate(0); // internal sample rate divider (optional)
+  Serial.println("MPU initialized");
+}
 
-  // Setup button pins
-  pinMode(TRIGGER_PIN, INPUT_PULLUP);
-  pinMode(SECONDARY_PIN, INPUT_PULLUP);
-
-  // Initialize BLE
+void initBLE() {
   BLEDevice::init("Ani21_3D_MOUSE");
-  BLEServer* server = BLEDevice::createServer();
-  server->setCallbacks(new MyCallbacks());
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new MyServerCallbacks());
 
-  // Create HID device
   hid = new BLEHIDDevice(server);
   inputMouse = hid->inputReport(1);
 
-  // Set HID report descriptor
-  hid->manufacturer()->setValue("Maker");
+  hid->manufacturer()->setValue("Ani21 Systems");
   hid->pnp(0x02, 0x05ac, 0x820a, 0x0001);
   hid->hidInfo(0x00, 0x01);
-  hid->reportMap((uint8_t*)hidReportDescriptor, sizeof(hidReportDescriptor));
+  hid->reportMap((uint8_t *)hidReportDescriptor, sizeof(hidReportDescriptor));
   hid->startServices();
 
-  // Advertising
-  BLEAdvertising* advertising = server->getAdvertising();
+  BLEAdvertising *advertising = server->getAdvertising();
   advertising->setAppearance(HID_MOUSE);
   advertising->addServiceUUID(hid->hidService()->getUUID());
+  advertising->setScanResponse(false);
+  advertising->setMinPreferred(0x0006);  // 7.5ms
+  advertising->setMaxPreferred(0x0010);  // 20ms
   advertising->start();
 
-  Serial.println("BLE Mouse ready");
+  Serial.println("BLE HID started");
+}
+
+// -------------- setup() and loop() --------------
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(1);
+
+  pinMode(TRIGGER_PIN, INPUT_PULLUP);
+  pinMode(SECONDARY_PIN, INPUT_PULLUP);
+
+  initMPU();
+  filter.begin(OUTPUT_RATE_HZ);   // Tell Madgwick the update frequency (averaged blocks)
+  filter.setBeta(0.08f);         // tune for responsiveness; 0.06-0.12 typical
+
+  initBLE();
+
+  // Create the queue for averaged blocks
+  avgQueue = xQueueCreate(AVG_QUEUE_LEN, sizeof(AvgSample));
+  if (!avgQueue) {
+    Serial.println("Failed to create avgQueue");
+    while (1) delay(1000);
+  }
+
+  // Create tasks pinned to core 1 for timing determinism
+  xTaskCreatePinnedToCore(samplingTask, "samplingTask", 4096, NULL, 3, NULL, 1);   // high priority
+  xTaskCreatePinnedToCore(processingTask, "processingTask", 8192, NULL, 2, NULL, 1); // lower priority
+
+  Serial.println("System ready. Sampling at 1kHz, processing at ~20Hz");
 }
 
 void loop() {
-  updateAngle();
-
-  int moveX = (int)(gyroY / SENSITIVITY_X);
-  int moveY = (int)(gyroX / SENSITIVITY_Y);
-
-  // Apply deadzone
-  if (abs(moveX) < 1) moveX = 0;
-  if (abs(moveY) < 1) moveY = 0;
-
-  // Constrain values to int8_t range
-  moveX = constrain(moveX, -127, 127);
-  moveY = constrain(moveY, -127, 127);
-
-  bool trigger = !digitalRead(TRIGGER_PIN);
-  bool secondary = !digitalRead(SECONDARY_PIN);
-
-  sendReport(moveX, moveY, trigger, secondary);
-
-  delay(5);
+  static uint32_t lastMs = 0;
+  uint32_t now = millis();
+  if (now - lastMs >= 5000) {
+    lastMs = now;
+    uint32_t sps = sampleCounter * 1000 / 5000;
+    uint32_t pps = processedCounter * 1000 / 5000;
+    sampleCounter = 0; processedCounter = 0;
+    Serial.printf("SPS: %u | PPS: %u | QueueMsgs: %u | Connected: %s\n",
+                  sps, pps, uxQueueMessagesWaiting(avgQueue), connected ? "Y":"N");
+    Serial.printf("Bias: X=%.3f Y=%.3f Z=%.3f | Angles: X=%.2f Y=%.2f\n",
+                  gyroBiasX, gyroBiasY, gyroBiasZ, smoothedAngleX, smoothedAngleY);
+  }
+  // keep loop free; let RTOS tasks run
+  vTaskDelay(pdMS_TO_TICKS(100));
 }
